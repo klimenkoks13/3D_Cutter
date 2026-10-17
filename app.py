@@ -1,8 +1,34 @@
 import os
 import tempfile
+import logging
 import numpy as np
 import trimesh
 import gradio as gr
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("3d-cutter")
+
+MAX_FILE_SIZE_MB = 100
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+
+_TEMP_FILES: set[str] = set()
+
+
+def _cleanup_temp_files() -> None:
+    """Удаляет старые временные файлы от предыдущих операций."""
+    for path in list(_TEMP_FILES):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            log.warning("Не удалось удалить временный файл %s: %s", path, e)
+        _TEMP_FILES.discard(path)
+
+
+def _track_temp_file(path: str) -> str:
+    _TEMP_FILES.add(path)
+    return path
+
 
 def load_txt_mesh(file_path: str) -> trimesh.Trimesh:
     vertices, faces = [], []
@@ -61,11 +87,13 @@ def save_txt_mesh(mesh: trimesh.Trimesh, path: str):
 
 def export_preview(mesh: trimesh.Trimesh) -> str:
     try:
-        path = tempfile.mktemp(suffix=".glb")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".glb") as f:
+            path = _track_temp_file(f.name)
         mesh.export(path)
         return path
     except Exception:
-        path = tempfile.mktemp(suffix=".stl")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".stl") as f:
+            path = _track_temp_file(f.name)
         mesh.export(path)
         return path
 
@@ -74,13 +102,30 @@ EMPTY_INFO = "**Шаг 2.** Здесь появится информация о 
 
 
 def analyze_model(file):
+    _cleanup_temp_files()
+
     if file is None:
-        return EMPTY_INFO, None, 0.0, 0.0, 0.0
+        return EMPTY_INFO, None, 0.0, 0.0, 0.0, None
+
+    try:
+        file_size = os.path.getsize(file.name)
+    except OSError as e:
+        return f"**Ошибка чтения файла:** `{e}`", None, 0.0, 0.0, 0.0, None
+
+    if file_size > MAX_FILE_SIZE:
+        return (
+            f"**Файл слишком велик:** {file_size / (1024 * 1024):.1f} МБ (макс. {MAX_FILE_SIZE_MB} МБ).",
+            None,
+            0.0,
+            0.0,
+            0.0,
+            None,
+        )
 
     try:
         mesh = load_model(file.name)
     except Exception as e:
-        return f"**Ошибка чтения файла:** `{e}`", None, 0.0, 0.0, 0.0
+        return f"**Ошибка чтения файла:** `{e}`", None, 0.0, 0.0, 0.0, None
 
     bmin, bmax = mesh.bounds
     center = mesh.centroid
@@ -92,6 +137,7 @@ def analyze_model(file):
         volume = "—"
 
     watertight = "да" if mesh.is_watertight else "нет"
+    watertight_warn = "" if mesh.is_watertight else "\n\n⚠️ Модель не замкнута — объём и обрезка могут быть неточными."
 
     info = f"""**Шаг 2.** Информация о модели:
 
@@ -102,10 +148,10 @@ def analyze_model(file):
 | **Размер** | {size[0]:.3f} | {size[1]:.3f} | {size[2]:.3f} |
 | **Центр** | {center[0]:.3f} | {center[1]:.3f} | {center[2]:.3f} |
 
-Вершин: **{len(mesh.vertices):,}** · Граней: **{len(mesh.faces):,}** · Объём: **{volume}** · Замкнута: **{watertight}**
+Вершин: **{len(mesh.vertices):,}** · Граней: **{len(mesh.faces):,}** · Объём: **{volume}** · Замкнута: **{watertight}**{watertight_warn}
 """
     preview = export_preview(mesh)
-    return info, preview, float(center[0]), float(center[1]), float(center[2])
+    return info, preview, float(center[0]), float(center[1]), float(center[2]), mesh
 
 
 def preset_x():   return 1.0, 0.0, 0.0
@@ -115,21 +161,10 @@ def preset_xy():  return 1.0, 1.0, 0.0
 def preset_xyz(): return 1.0, 1.0, 1.0
 
 
-def cut_mesh(file, px, py, pz, nx, ny, nz, keep_positive):
-    if file is None:
-        return None, None, None, None, "**Шаг 5.** Сначала загрузите файл модели."
-
-    try:
-        mesh = load_model(file.name)
-    except Exception as e:
-        return None, None, None, None, f"**Ошибка загрузки:** `{e}`"
-
-    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0:
-        return None, None, None, None, "**Не удалось распознать меш в файле.**"
-
+def _apply_single_cut(mesh: trimesh.Trimesh, px, py, pz, nx, ny, nz, keep_positive):
     normal = np.array([nx, ny, nz], dtype=float)
     if np.linalg.norm(normal) < 1e-9:
-        return None, None, None, None, "**Нормаль не может быть нулевой.**"
+        raise ValueError("Нормаль не может быть нулевой.")
     normal /= np.linalg.norm(normal)
 
     point = np.array([px, py, pz], dtype=float)
@@ -143,33 +178,82 @@ def cut_mesh(file, px, py, pz, nx, ny, nz, keep_positive):
     ])
     dists = (corners - point) @ normal
     if np.all(dists > 0) or np.all(dists < 0):
-        return None, None, None, None, (
-            "**Шаг 5. Плоскость не пересекает модель.**\n\n"
+        raise ValueError(
+            "Плоскость не пересекает модель.\n\n"
             f"Границы: min `({bmin[0]:.3f}, {bmin[1]:.3f}, {bmin[2]:.3f})`, "
             f"max `({bmax[0]:.3f}, {bmax[1]:.3f}, {bmax[2]:.3f})`\n\n"
             f"Центр: `({mesh.centroid[0]:.3f}, {mesh.centroid[1]:.3f}, {mesh.centroid[2]:.3f})`\n\n"
             "Выберите точку внутри границ модели."
         )
 
-    try:
-        if keep_positive:
-            cut = mesh.slice_plane(plane_origin=point, plane_normal=normal)
-        else:
-            cut = mesh.slice_plane(plane_origin=point, plane_normal=-normal)
-    except Exception as e:
-        return None, None, None, None, f"**Ошибка обрезки:** `{e}`"
-
+    cut = mesh.slice_plane(plane_origin=point, plane_normal=normal if keep_positive else -normal)
     if cut is None or len(cut.vertices) == 0:
-        return None, None, None, None, "**Результат пустой.**"
+        raise ValueError("Результат обрезки пустой.")
+    return cut
 
-    txt_path = tempfile.mktemp(suffix=".txt")
+
+def cut_mesh(file, current_mesh, px, py, pz, nx, ny, nz, keep_positive):
+    _cleanup_temp_files()
+
+    if file is None and current_mesh is None:
+        return None, None, None, None, None, "**Шаг 5.** Сначала загрузите файл модели."
+
+    try:
+        if current_mesh is not None:
+            mesh = current_mesh
+        else:
+            if file is None:
+                return None, None, None, None, None, "**Шаг 5.** Сначала загрузите файл модели."
+            file_size = os.path.getsize(file.name)
+            if file_size > MAX_FILE_SIZE:
+                return (
+                    None, None, None, None, None,
+                    f"**Файл слишком велик:** {file_size / (1024 * 1024):.1f} МБ (макс. {MAX_FILE_SIZE_MB} МБ).",
+                )
+            mesh = load_model(file.name)
+    except OSError as e:
+        return None, None, None, None, None, f"**Ошибка чтения файла:** `{e}`"
+    except Exception as e:
+        return None, None, None, None, None, f"**Ошибка загрузки:** `{e}`"
+
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0:
+        return None, None, None, None, None, "**Не удалось распознать меш в файле.**"
+
+    try:
+        cut = _apply_single_cut(mesh, px, py, pz, nx, ny, nz, keep_positive)
+    except ValueError as e:
+        return None, None, None, None, mesh, f"**Ошибка обрезки:** `{e}`"
+    except Exception as e:
+        return None, None, None, None, mesh, f"**Ошибка обрезки:** `{e}`"
+
+    txt_path = None
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as f:
+        txt_path = _track_temp_file(f.name)
     save_txt_mesh(cut, txt_path)
 
-    stl_path = tempfile.mktemp(suffix=".stl")
+    stl_path = None
     try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".stl") as f:
+            stl_path = _track_temp_file(f.name)
         cut.export(stl_path)
     except Exception:
         stl_path = None
+
+    obj_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".obj") as f:
+            obj_path = _track_temp_file(f.name)
+        cut.export(obj_path)
+    except Exception:
+        obj_path = None
+
+    ply_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ply") as f:
+            ply_path = _track_temp_file(f.name)
+        cut.export(ply_path)
+    except Exception:
+        ply_path = None
 
     glb_path = export_preview(cut)
 
@@ -181,7 +265,133 @@ def cut_mesh(file, px, py, pz, nx, ny, nz, keep_positive):
         f"| Граней | {len(mesh.faces):,} | **{len(cut.faces):,}** |\n\n"
         f"Плоскость: точка `({px}, {py}, {pz})`, нормаль `({nx}, {ny}, {nz})`"
     )
-    return txt_path, stl_path, glb_path, glb_path, status
+    return txt_path, stl_path, obj_path, ply_path, glb_path, glb_path, cut, status
+
+
+def cut_mesh_batch(file, current_mesh, planes_text, keep_positive):
+    """Последовательная обрезка по нескольким плоскостям.
+
+    planes_text — текст с одной плоскостью на строку, форматы:
+    "px py pz nx ny nz" или "px,py,pz,nx,ny,nz"
+    """
+    _cleanup_temp_files()
+
+    if file is None and current_mesh is None:
+        return None, None, None, None, None, "**Шаг 5.** Сначала загрузите файл модели."
+
+    try:
+        if current_mesh is not None:
+            mesh = current_mesh
+        else:
+            if file is None:
+                return None, None, None, None, None, "**Шаг 5.** Сначала загрузите файл модели."
+            file_size = os.path.getsize(file.name)
+            if file_size > MAX_FILE_SIZE:
+                return (
+                    None, None, None, None, None,
+                    f"**Файл слишком велик:** {file_size / (1024 * 1024):.1f} МБ (макс. {MAX_FILE_SIZE_MB} МБ).",
+                )
+            mesh = load_model(file.name)
+    except OSError as e:
+        return None, None, None, None, None, f"**Ошибка чтения файла:** `{e}`"
+    except Exception as e:
+        return None, None, None, None, None, f"**Ошибка загрузки:** `{e}`"
+
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0:
+        return None, None, None, None, None, "**Не удалось распознать меш в файле.**"
+
+    planes = []
+    for line_num, line in enumerate(planes_text.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p for p in line.replace(",", " ").split() if p]
+        if len(parts) != 6:
+            return None, None, None, None, mesh, (
+                f"**Ошибка в строке {line_num}:** ожидалось 6 чисел (px py pz nx ny nz), "
+                f"получено {len(parts)}"
+            )
+        try:
+            px, py, pz, nx, ny, nz = (float(p) for p in parts)
+        except ValueError as e:
+            return None, None, None, None, mesh, (
+                f"**Ошибка в строке {line_num}:** неверное число (`{e}`)"
+            )
+        if all(v == 0 for v in (px, py, pz, nx, ny, nz)):
+            continue
+        planes.append((px, py, pz, nx, ny, nz))
+
+    if not planes:
+        return None, None, None, None, mesh, "**Список плоскостей пуст.**"
+
+    current = mesh
+    total_vertices = len(current.vertices)
+    total_faces = len(current.faces)
+
+    for i, (px, py, pz, nx, ny, nz) in enumerate(planes):
+        try:
+            current = _apply_single_cut(current, px, py, pz, nx, ny, nz, keep_positive)
+        except ValueError as e:
+            return None, None, None, None, current, (
+                f"**Ошибка обрезки плоскости #{i + 1}:** `{e}`"
+            )
+        except Exception as e:
+            return None, None, None, None, current, (
+                f"**Ошибка обрезки плоскости #{i + 1}:** `{e}`"
+            )
+
+    txt_path = None
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as f:
+        txt_path = _track_temp_file(f.name)
+    save_txt_mesh(current, txt_path)
+
+    stl_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".stl") as f:
+            stl_path = _track_temp_file(f.name)
+        current.export(stl_path)
+    except Exception:
+        stl_path = None
+
+    obj_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".obj") as f:
+            obj_path = _track_temp_file(f.name)
+        current.export(obj_path)
+    except Exception:
+        obj_path = None
+
+    ply_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ply") as f:
+            ply_path = _track_temp_file(f.name)
+        current.export(ply_path)
+    except Exception:
+        ply_path = None
+
+    glb_path = export_preview(current)
+
+    status = (
+        "**Шаг 5. Готово (пакетная обрезка).**\n\n"
+        "| | Было | Стало |\n"
+        "|:---|---:|---:|\n"
+        f"| Вершин | {total_vertices:,} | **{len(current.vertices):,}** |\n"
+        f"| Граней | {total_faces:,} | **{len(current.faces):,}** |\n\n"
+        f"Плоскостей применено: **{len(planes)}**"
+    )
+    return txt_path, stl_path, obj_path, ply_path, glb_path, glb_path, current, status
+
+
+def reset_mesh(file):
+    """Сброс состояния меша к исходной модели из файла."""
+    if file is None:
+        return None, None, None, "**Нет загруженной модели для сброса.**"
+    try:
+        mesh = load_model(file.name)
+        preview = export_preview(mesh)
+        return mesh, preview, preview, "**Состояние сброшено к исходной модели.**"
+    except Exception as e:
+        return None, None, None, f"**Ошибка сброса:** `{e}`"
 
 CUSTOM_CSS = """
 /* ============ Общий фон ============ */
@@ -228,7 +438,7 @@ footer { display: none !important; }
     border: 1px solid #DDE2EA !important;
     border-radius: 12px !important;
     box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04) !important;
-    overflow: visible !important;
+    overflow: hidden !important;
 }
 .card-block:last-child {
     margin-bottom: 0 !important;
@@ -461,6 +671,132 @@ fieldset input[type="radio"]:checked::after {
     text-align: center;
     padding: 24px 0 8px 0;
 }
+
+/* ============ Адаптивность ============ */
+@media (max-width: 768px) {
+    .gradio-container {
+        padding: 16px 12px !important;
+    }
+
+    .card-block {
+        padding: 16px 18px !important;
+        margin-bottom: 12px !important;
+        overflow: hidden !important;
+    }
+
+    #app-header h1 {
+        font-size: 1.35rem !important;
+    }
+
+    #app-header p {
+        font-size: 0.85rem !important;
+    }
+
+    .step-title p,
+    .step-title strong {
+        font-size: 0.9rem !important;
+    }
+
+    .hint-text p {
+        font-size: 0.8rem !important;
+        margin: 8px 0 4px 0 !important;
+    }
+
+    input[type="number"],
+    input[type="text"],
+    textarea {
+        font-size: 0.85rem !important;
+        padding: 8px 10px !important;
+    }
+
+    .preset-row button,
+    button.gr-button-secondary {
+        font-size: 0.8rem !important;
+        padding: 6px 10px !important;
+    }
+
+    .cut-btn button,
+    button.gr-button-primary {
+        font-size: 0.9rem !important;
+        padding: 12px 16px !important;
+    }
+
+    /* На маленьких экранах колонки идут одной строкой */
+    .gradio-container > .main .gr-column {
+        width: 100% !important;
+    }
+
+    .gradio-container .gr-row {
+        flex-wrap: wrap !important;
+        gap: 8px !important;
+    }
+
+    .gradio-container .gr-row > * {
+        flex: 1 1 200px !important;
+        min-width: 150px !important;
+        box-sizing: border-box !important;
+    }
+
+    button.gr-button-primary,
+    button.gr-button-secondary {
+        width: auto !important;
+        box-sizing: border-box !important;
+    }
+
+    .gradio-container table {
+        font-size: 0.8rem !important;
+        width: 100% !important;
+        table-layout: fixed !important;
+    }
+
+    .gradio-container table th,
+    .gradio-container table td {
+        padding: 4px 6px !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+    }
+}
+
+@media (max-width: 480px) {
+    .gradio-container {
+        padding: 12px 8px !important;
+    }
+
+    #app-header h1 {
+        font-size: 1.2rem !important;
+    }
+
+    .card-block {
+        padding: 14px 16px !important;
+        overflow: hidden !important;
+    }
+
+    .viewer-box {
+        height: 240px !important;
+    }
+
+    input[type="number"],
+    input[type="text"] {
+        font-size: 0.8rem !important;
+    }
+
+    .preset-row {
+        flex-wrap: wrap !important;
+        gap: 6px !important;
+    }
+
+    .preset-row button {
+        flex: 1 1 45% !important;
+        font-size: 0.75rem !important;
+        padding: 5px 8px !important;
+    }
+
+    .gradio-container .gr-row > * {
+        flex: 1 1 120px !important;
+        min-width: 100px !important;
+    }
+}
 """
 
 HEAD_HTML = """
@@ -477,9 +813,6 @@ HEAD_HTML = """
 
 
 with gr.Blocks(
-    theme=gr.themes.Soft(primary_hue="slate", neutral_hue="slate"),
-    css=CUSTOM_CSS,
-    head=HEAD_HTML,
     title="3D Cutter",
 ) as demo:
 
@@ -487,7 +820,7 @@ with gr.Blocks(
         """
         <div id="app-header">
             <h1>3D Cutter</h1>
-            <p>Обрезка 3D-моделей по плоскости. Экспорт в TXT / STL / GLB</p>
+            <p>Обрезка 3D-моделей по плоскости. Экспорт в TXT / STL / OBJ / PLY / GLB</p>
         </div>
         """
     )
@@ -529,6 +862,9 @@ with gr.Blocks(
             container=False,
             elem_classes="hint-text info-box",
         )
+
+    # скрытое состояние текущего меша (для последовательной обрезки)
+    current_mesh_state = gr.State(None)
 
     # выбор плоскости
     with gr.Column(elem_classes="card-block"):
@@ -598,12 +934,41 @@ with gr.Blocks(
             container=False,
             elem_classes="step-title",
         )
+
+        gr.Markdown(
+            "**3.1.** Последовательная обрезка (одна плоскость):",
+            container=False,
+            elem_classes="hint-text",
+        )
         btn_cut = gr.Button(
             "Обрезать",
             variant="primary",
             size="lg",
             elem_classes="cut-btn",
         )
+
+        gr.Markdown(
+            "**3.2.** Пакетная обрезка (несколько плоскостей подряд):",
+            container=False,
+            elem_classes="hint-text",
+        )
+        planes_text = gr.Textbox(
+            label="Плоскости (по одной на строку: px py pz nx ny nz)",
+            placeholder="0 0 0 1 0 0\n0 0 0 0 1 0\n0 0 0 0 0 1",
+            lines=5,
+        )
+        btn_cut_batch = gr.Button(
+            "Обрезать по всем плоскостям",
+            variant="secondary",
+            size="sm",
+        )
+
+        btn_reset = gr.Button(
+            "Сбросить состояние",
+            variant="secondary",
+            size="sm",
+        )
+
         status = gr.Markdown(
             "Загрузите модель, задайте плоскость и нажмите «Обрезать».",
             container=False,
@@ -620,6 +985,9 @@ with gr.Blocks(
         with gr.Row():
             out_txt = gr.File(label="TXT", interactive=False)
             out_stl = gr.File(label="STL", interactive=False)
+            out_obj = gr.File(label="OBJ", interactive=False)
+        with gr.Row():
+            out_ply = gr.File(label="PLY", interactive=False)
             out_glb = gr.File(label="GLB", interactive=False)
 
     gr.HTML('<div id="app-footer">3D Cutter · Python, Gradio, trimesh</div>')
@@ -627,13 +995,13 @@ with gr.Blocks(
     file_input.change(
         fn=analyze_model,
         inputs=file_input,
-        outputs=[model_info, original_preview, px, py, pz],
+        outputs=[model_info, original_preview, px, py, pz, current_mesh_state],
     )
 
     btn_center.click(
         fn=analyze_model,
         inputs=file_input,
-        outputs=[model_info, original_preview, px, py, pz],
+        outputs=[model_info, original_preview, px, py, pz, current_mesh_state],
     )
 
     btn_x.click(fn=preset_x, outputs=[nx, ny, nz])
@@ -644,14 +1012,34 @@ with gr.Blocks(
 
     btn_cut.click(
         fn=cut_mesh,
-        inputs=[file_input, px, py, pz, nx, ny, nz, keep_side],
-        outputs=[out_txt, out_stl, out_glb, result_preview, status],
+        inputs=[file_input, current_mesh_state, px, py, pz, nx, ny, nz, keep_side],
+        outputs=[out_txt, out_stl, out_obj, out_ply, out_glb, result_preview, current_mesh_state, status],
     ).then(
         fn=None,
         js="() => window.scrollTo({top: 0, behavior: 'smooth'})",
     )
 
+    btn_cut_batch.click(
+        fn=cut_mesh_batch,
+        inputs=[file_input, current_mesh_state, planes_text, keep_side],
+        outputs=[out_txt, out_stl, out_obj, out_ply, out_glb, result_preview, current_mesh_state, status],
+    ).then(
+        fn=None,
+        js="() => window.scrollTo({top: 0, behavior: 'smooth'})",
+    )
+
+    btn_reset.click(
+        fn=reset_mesh,
+        inputs=[file_input],
+        outputs=[current_mesh_state, original_preview, result_preview, status],
+    )
+
 if __name__ == "__main__":
     import os
-    port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    _cleanup_temp_files()
+    demo.launch(
+        server_name="0.0.0.0",
+        theme=gr.themes.Soft(primary_hue="slate", neutral_hue="slate"),
+        css=CUSTOM_CSS,
+        head=HEAD_HTML,
+    )
